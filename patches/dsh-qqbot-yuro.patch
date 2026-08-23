@@ -1,0 +1,1614 @@
+diff --git a/dist/commands/index.js b/dist/commands/index.js
+index 716d69c8bcf5ce31a12d13cf8c799aeb36eee8be..565c6dca2a805087c2dcf6eea314b1d9e300a629 100644
+--- a/dist/commands/index.js
++++ b/dist/commands/index.js
+@@ -18,7 +18,7 @@ export function buildCommandList(deps) {
+         // 杂项
+         pingCommand(),
+         versionCommand(deps),
+-        stopCommand(),
++        stopCommand(deps),
+     ];
+     // help 需要访问完整列表（含自身），通过闭包惰性引用
+     commands.push(helpCommand(deps, () => commands));
+diff --git a/dist/commands/misc.js b/dist/commands/misc.js
+index 82a85d79ab2aca3508c5761f42e68d6bd5062cbf..d3d3c75fe7af29fb4d31c7649911723e09ba8ab4 100644
+--- a/dist/commands/misc.js
++++ b/dist/commands/misc.js
+@@ -19,12 +19,25 @@ export function versionCommand({ manager }) {
+     };
+ }
+ /** /bot-stop — 中止当前生成（隐藏） */
+-export function stopCommand() {
++export function stopCommand({ manager } = {}) {
+     return {
+         name: 'bot-stop',
+         description: '中止当前生成',
+         hidden: true,
+-        handler: () => ({ kind: 'noop' }),
++        handler: (ctx) => {
++            // [local-patch 2026-08-17 P0-1] 上游 PR #6：实际中止进行中的生成
++            const m = ctx?.message;
++            if (!m || !manager)
++                return '⏹️ 无法中止（缺少上下文）';
++            const scope = m.kind === 'group' ? 'group' : 'c2c';
++            const peerId = scope === 'group' ? (m.groupOpenid ?? m.senderId) : m.senderId;
++            const record = manager.getSessionRecord(scope, peerId);
++            if (!record) {
++                return '⏹️ 当前没有进行中的任务';
++            }
++            record.agent.cancel({ kind: 'user' });
++            return '⏹️ 已发送中止指令';
++        },
+     };
+ }
+ //# sourceMappingURL=misc.js.map
+\ No newline at end of file
+diff --git a/dist/config.js b/dist/config.js
+index 1fbe7fc25b80d51332c0fdd00b0ee006b7d73a54..90efeef33c28aa599861c2e61b0915d3e20624d3 100644
+--- a/dist/config.js
++++ b/dist/config.js
+@@ -8,6 +8,9 @@ export const ConfigSchema = Schema.object({
+     provider: Schema.string().description('LLM provider name'),
+     model: Schema.string().description('Model name'),
+     preset: Schema.string().description('Agent preset id'),
++    // [local-patch 2026-08-19 P2-9] 双人格独立模型: 群聊默认模型路由(私聊不受影响)
++    groupProvider: Schema.string().description('Group chat default LLM provider (dual-persona)'),
++    groupModel: Schema.string().description('Group chat default model (dual-persona)'),
+     cwd: Schema.string().description('Agent working directory'),
+     requireMention: Schema.boolean().default(true).description('群聊是否需要@bot触发'),
+     groupPrompt: Schema.string().description('群聊额外system prompt'),
+@@ -16,7 +19,7 @@ export const ConfigSchema = Schema.object({
+     streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
+     sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
+     maxQueue: Schema.number().default(20).description('并发队列最大长度'),
+-    processingTimeoutMs: Schema.number().default(120000).description('处理超时(ms)'),
++    processingTimeoutMs: Schema.number().default(600000).description('处理超时(ms)；[local-patch 2026-08-17 P0-3] 120s→600s，避免 reasoning max+多工具链下静默超时'),
+     historyLimit: Schema.number().default(10).description('群历史缓冲条数'),
+     access: Schema.object({
+         c2cMode: Schema.union(['open', 'allowlist', 'disabled']).default('open').description('C2C访问模式'),
+@@ -30,6 +33,9 @@ export const ConfigSchema = Schema.object({
+         groupAllow: [],
+     }).description('访问控制'),
+     showToolResults: Schema.boolean().default(false).description('是否展示工具调用成功结果（错误始终展示）'),
++    // [local-patch 2026-08-17] 思考过程/工具步骤可见性（QQ 无代码块，用引用块呈现）
++    showReasoning: Schema.boolean().default(true).description('是否展示思考过程摘要（💭 引用块）'),
++    showToolCalls: Schema.boolean().default(true).description('是否展示工具调用步骤（🔧 提示）'),
+     debug: Schema.boolean().default(false),
+ });
+ //# sourceMappingURL=config.js.map
+\ No newline at end of file
+diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
+index 891174c77e0fd8d2177ebec9bce0c1ceb04dd863..a497ecaee7f595d00d7bbf2f216d4ae39aa2526c 100644
+--- a/dist/gateway/bootstrap.js
++++ b/dist/gateway/bootstrap.js
+@@ -1,8 +1,11 @@
+ import { QQBot } from '@tencent-connect/qqbot-nodejs';
++import { readFileSync, existsSync, statSync, rmSync } from 'node:fs'; // [local-patch 2026-08-17 P2-1] last-peer 读取; [P2-16] announce 轮询
+ import { SessionManager } from '../session/index.js';
+ import { handleInbound, createOutboundHandler } from '../transport/index.js';
+ import { buildUserAgent } from '../shared/index.js';
+ import { setupMiddlewares } from './middleware-setup.js';
++// [local-patch 2026-08-20 P2-11] 群聊生图/表情包/发图工具
++import { registerGroupTools } from '../group-tools.js';
+ export async function bootstrapGateway(ctx, agents, config, logger) {
+     const manager = new SessionManager(ctx, agents, config, logger);
+     // ── 初始化 QQ Bot SDK ──
+@@ -15,6 +18,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
+         userAgent,
+         logger,
++        markdownSupport: true, // [local-patch 2026-08-17 P0-4] 命令回复 markdown 渲染（QQ 2026-04-23 起全量开放）
+     });
+     logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
+     // ── 中间件链 ──
+@@ -22,6 +26,8 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     // ── 入站：经过中间件链后的消息交给 dsh agent ──
+     bot.on('message', async (mCtx) => {
+         const msg = mCtx.message;
++        // [local-patch 2026-08-17 debug] 消息到达日志（console 进 dsh-web.log）
++        console.log(`[im-qqbot] ← message kind=${msg.kind} content="${String(msg.content ?? '').slice(0, 80)}"`);
+         if (config.debug) {
+             logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
+         }
+@@ -39,6 +45,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）
+     const sender = {
+         sendMarkdown: (target, content) => bot.sendMarkdown(target, content),
++        sendTyping: (target) => bot.sendTyping(target, 60), // [local-patch 2026-08-17] typing 心跳
++        // [local-patch 2026-08-19 P2-11] 图片/文件发送能力（生图技能 + 表情包技能需要）
++        sendImage: (target, source, opts) => bot.sendImage(target, source, opts),
++        sendFile: (target, source, opts) => bot.sendFile(target, source, opts),
+         openStream: (target) => bot.openStream({
+             target: {
+                 scope: target.scope,
+@@ -50,11 +60,52 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
+     ctx
+         .on('session/event', outboundHandler);
++    // [local-patch 2026-08-20 P2-11] 注册群聊工具(生图/发图/表情包) — 需 ctx.tools 服务
++    try {
++        registerGroupTools(ctx, sender, manager, logger);
++    } catch (e) {
++        logger.warn(`group tools registration skipped: ${e?.message || e}`);
++    }
+     bot.on('error', (err) => {
+         logger.error(`bot error: ${err instanceof Error ? err.message : String(err)}`);
+     });
+     bot.on('ready', () => {
+         console.log(`[im-qqbot] Bot ready! appId=${config.appId}`);
++        // [local-patch 2026-08-18 P2-3] 通知节流: 首次连接(正常启动)不打扰;
++        // 断线重连才通知且 180 分钟冷却(腾讯网关 TTL ~30min 轮换会反复触发 ready, 防刷屏;
++        // 短时间内反复断线=真故障, 仍会收到警报)。首次即设冷却起点,
++        // 避免启动期多条连接连续 ready 时第二次就漏发(08-18 实测: 启动瞬间 4 连 ready)
++        // [local-patch 2026-08-19 P2-4] 升级: 断线时长判据 + 24h 冷却。
++        //   - SDK 层 (gateway-connection.js) 在 ws close 时写入 globalThis.__qqbotLastCloseAt
++        //   - 仅当断线持续 > 5min (真故障, 如 08-19 18:21 断 31min) 且距上次通知 > 24h 才发
++        //   - 腾讯 TTL ~30min 轮换 (close->秒级重连) 被 5min 判据完全挡掉, 不再刷屏
++        const now = Date.now();
++        if (!globalThis.__qqbotReadySeen) {
++            globalThis.__qqbotReadySeen = true;
++            globalThis.__qqbotNoticeAt = now;
++            return;
++        }
++        const lastCloseAt = globalThis.__qqbotLastCloseAt || 0;
++        const outageSec = lastCloseAt ? (now - lastCloseAt) / 1000 : Infinity;
++        if (outageSec < 5 * 60) {
++            return; // 断线 <5min: TTL 轮换或瞬时抖动, 不打扰
++        }
++        if (now - (globalThis.__qqbotNoticeAt || 0) < 24 * 60 * 60 * 1000) {
++            return; // 24h 冷却: 一天最多 1 条
++        }
++        globalThis.__qqbotNoticeAt = now;
++        // [local-patch 2026-08-17 P2-1] 重连后主动通知最后活跃 peer（对齐 Hermes .restart_notify 机制）
++        // 主动消息受平台限制（主动推送已停用），失败仅记日志，不影响启动
++        try {
++            const peer = JSON.parse(readFileSync('C:/Users/<USER>/.dsh/qqbot-last-peer.json', 'utf8'));
++            if (peer?.peerId) {
++                const target = { scope: peer.scope === 'group' ? 'group' : 'c2c', targetId: peer.peerId };
++                bot.send({ target, content: '✅ DSH QQ 已重连' })
++                    .then(() => logger.info(`proactive notice sent to ${peer.scope}:${peer.peerId}`))
++                    .catch((err) => logger.warn(`proactive notice failed (platform limit?): ${err instanceof Error ? err.message : String(err)}`));
++            }
++        }
++        catch { /* 无 last-peer 记录则跳过 */ }
+     });
+     // ── 生命周期 ──
+     ctx
+@@ -63,7 +114,47 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         bot.start().catch((err) => {
+             logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+         });
++        // [local-patch 2026-08-20 P2-16] 到点任务轮询: 检查 announce.json, 有则主动发群消息
++        // 供 cron 定时任务使用(早 8 点起床问候/睡前道晚安/预算超限通知)
++        // [local-patch 2026-08-21] 发送结果 console 落盘 + 失败保留重试(防 yuro_maintain 误报成功)
++        const ANNOUNCE_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/announce.json';
++        const GROUP_TARGET_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/last_group_target.json';
++        const pollTimer = setInterval(async () => {
++            try {
++                if (!existsSync(ANNOUNCE_FILE)) return;
++                // 防死循环: 文件存在超 10 分钟仍未发出 → 放弃删除
++                try {
++                    const st = statSync(ANNOUNCE_FILE);
++                    if (Date.now() - st.mtimeMs > 600000) {
++                        console.error(`[announce] GIVEUP (stale >10min) "${ANNOUNCE_FILE}"`);
++                        rmSync(ANNOUNCE_FILE, { force: true });
++                        return;
++                    }
++                } catch { /* stat 失败则继续 */ }
++                const announce = JSON.parse(readFileSync(ANNOUNCE_FILE, 'utf-8'));
++                const text = announce?.text;
++                if (!text) { rmSync(ANNOUNCE_FILE, { force: true }); return; }
++                // 找群 target: 内存会话 → 持久化文件
++                let target = null;
++                try {
++                    for (const record of manager.sessions.values()) {
++                        if (record.scope === 'group' && record.replyTarget) {
++                            target = { scope: 'group', targetId: record.replyTarget.targetId };
++                            break;
++                        }
++                    }
++                } catch { /* ignore */ }
++                if (!target && existsSync(GROUP_TARGET_FILE)) {
++                    try {
++                        const saved = JSON.parse(readFileSync(GROUP_TARGET_FILE, 'utf-8'));
++                        if (saved?.scope && saved?.targetId) target = { scope: saved.scope, targetId: saved.targetId };
++                    } catch { /* ignore */ }
++                }
++                if (!target) {
++                    console.warn(`[announce] SKIP: no group target ("${text.slice(0, 30)}")`);
++                    rmSync(ANNOUNCE_FILE, { force: true });
++                    return;
++                }
++                await bot.sendMarkdown(target, text);
++                console.log(`[announce] sent: "${text.slice(0, 40)}"`);
++                rmSync(ANNOUNCE_FILE, { force: true });
++            } catch (e) {
++                // 发送失败: 保留 announce.json 30s 后自动重试; 超 10 分钟由上方兜底放弃
++                console.error(`[announce] FAIL (retry in 30s): ${e instanceof Error ? e.message : String(e)}`);
++            }
++        }, 30000);
+         return async () => {
++            clearInterval(pollTimer);
+             logger.info('Shutting down');
+             await manager.disposeAll();
+             bot.stop();
+diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
+index f871b9350299b50083bfb1f96784bcd175a6b871..0b1a8a496de3a696626b97eda95aca8388279ead 100644
+--- a/dist/gateway/middleware-setup.js
++++ b/dist/gateway/middleware-setup.js
+@@ -62,7 +62,9 @@ export function setupMiddlewares(bot, config, manager, logger) {
+         },
+     }));
+     // 10. C2C 输入状态指示
+-    bot.use(typingIndicator());
++    // [local-patch 2026-08-17 P1-1] awaitTyping=true：首帧 typing 立即发出；
++    // keepalive(50s) 覆盖整个生成期（配合 inbound 的 await whenIdle，中间件链持续到轮次结束）
++    bot.use(typingIndicator({ awaitTyping: true }));
+     // 11. 引用消息解析（记录 + 解析被引用原文）
+     bot.use(quoteRef({
+         maxSize: 500,
+diff --git a/dist/group-tools.js b/dist/group-tools.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..9040b8f447faf9c0495ae740130e71fa37c0a206
+--- /dev/null
++++ b/dist/group-tools.js
+@@ -0,0 +1,299 @@
++// [local-patch 2026-08-20 P2-11] 群聊生图/表情包/发图工具注册
++// 由 bootstrap.js 在 apply 时调用: registerGroupTools(ctx, sender)
++// 依赖: ctx.tools (harness tools 服务), sender (含 sendImage)
++import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync, copyFileSync } from 'node:fs';
++import { join, dirname } from 'node:path';
++import { randomUUID } from 'node:crypto';
++import { spawn } from 'node:child_process'; // [local-patch 2026-08-20 P2-12] ComfyUI 懒启动
++
++const COMFYUI_BASE = 'http://127.0.0.1:5000';
++const COMFYUI_WF = '<COMFYUI_HOME>/test_workflow.json';
++const COMFYUI_OUT = '<COMFYUI_HOME>/ComfyUI/output';
++const STICKER_DIR = 'C:/Users/<USER>/.dsh/<WORK_DIR>/stickers';
++
++// [local-patch 2026-08-20 P2-12] ComfyUI 懒启动: 调用时检测, 未启动则拉起
++const COMFYUI_HOME = '<COMFYUI_HOME>';
++const COMFYUI_PYTHON = COMFYUI_HOME + '/python_embeded/python.exe';
++const COMFYUI_LOG = 'C:/Users/<USER>/.dsh/<WORK_DIR>/comfyui.log';
++let _comfyStarting = false;
++let _comfyStartPromise = null;
++
++async function comfyAlive() {
++    try {
++        const ctrl = new AbortController();
++        const t = setTimeout(() => ctrl.abort(), 3000);
++        try {
++            const resp = await fetch(COMFYUI_BASE + '/system_stats', { signal: ctrl.signal });
++            return resp.ok;
++        } finally { clearTimeout(t); }
++    } catch { return false; }
++}
++
++async function startComfyUI() {
++    if (await comfyAlive()) return;
++    if (_comfyStarting) return _comfyStartPromise;
++    _comfyStarting = true;
++    _comfyStartPromise = (async () => {
++        const { mkdirSync } = await import('node:fs');
++        const { dirname } = await import('node:path');
++        mkdirSync(dirname(COMFYUI_LOG), { recursive: true });
++        const logFd = await import('node:fs').then(fs => fs.openSync(COMFYUI_LOG, 'a'));
++        const child = spawn(COMFYUI_PYTHON, ['-s', 'ComfyUI/main.py', '--windows-standalone-build', '--port', '5000', '--disable-auto-launch'], {
++            cwd: COMFYUI_HOME,
++            detached: true,
++            stdio: ['ignore', logFd, logFd],
++        });
++        child.unref();
++        // 等就绪: 首次启动需编译 CUDA 内核 60-120s
++        for (let i = 0; i < 90; i++) {
++            await new Promise(r => setTimeout(r, 2000));
++            if (await comfyAlive()) { _comfyStarting = false; return; }
++        }
++        _comfyStarting = false;
++        throw new Error('ComfyUI 启动超时(180s), 见日志: ' + COMFYUI_LOG);
++    })();
++    return _comfyStartPromise;
++}
++
++/** 确保 ComfyUI 已启动(未启动则拉起并等待就绪) */
++async function ensureComfyUI() {
++    if (await comfyAlive()) return;
++    await startComfyUI();
++}
++
++async function comfyPost(path, data, timeoutMs = 120000) {
++    const ctrl = new AbortController();
++    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
++    try {
++        const resp = await fetch(COMFYUI_BASE + path, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify(data),
++            signal: ctrl.signal,
++        });
++        if (!resp.ok) throw new Error(`ComfyUI HTTP ${resp.status}`);
++        return await resp.json();
++    } finally { clearTimeout(timer); }
++}
++
++async function comfyGet(path, timeoutMs = 60000) {
++    const ctrl = new AbortController();
++    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
++    try {
++        const resp = await fetch(COMFYUI_BASE + path, { signal: ctrl.signal });
++        if (!resp.ok) throw new Error(`ComfyUI HTTP ${resp.status}`);
++        return await resp.json();
++    } finally { clearTimeout(timer); }
++}
++
++/** 用 ComfyUI API 生图: 确保启动 → 改 workflow → 提交 → 轮询 → 返回图片绝对路径 */
++async function generateImage({ prompt, negative_prompt, width, height, steps, seed, filename_prefix, model }) {
++    await ensureComfyUI(); // [local-patch 2026-08-20 P2-12] 未启动则自动拉起
++    if (!existsSync(COMFYUI_WF)) throw new Error('workflow 文件不存在: ' + COMFYUI_WF);
++    const wf = JSON.parse(readFileSync(COMFYUI_WF, 'utf-8'));
++    const p = wf.prompt;
++    // 找 CLIPTextEncode 节点: 第一个是正向, 第二个是负向
++    const encodeNodes = Object.entries(p).filter(([, n]) => n.class_type === 'CLIPTextEncode');
++    if (encodeNodes.length < 2) throw new Error('workflow 缺少 CLIPTextEncode 节点');
++    const [posId, posNode] = encodeNodes[0];
++    const [negId, negNode] = encodeNodes[1];
++    posNode.inputs.text = prompt || posNode.inputs.text;
++    if (negative_prompt) negNode.inputs.text = negative_prompt;
++    // 尺寸节点
++    const emptyNodes = Object.entries(p).filter(([, n]) => n.class_type === 'EmptyLatentImage');
++    if (emptyNodes.length > 0) {
++        emptyNodes[0][1].inputs.width = width || 1024;
++        emptyNodes[0][1].inputs.height = height || 1024;
++    }
++    // KSampler: steps/seed
++    const ksNodes = Object.entries(p).filter(([, n]) => n.class_type === 'KSampler');
++    if (ksNodes.length > 0) {
++        if (steps) ksNodes[0][1].inputs.steps = steps;
++        if (seed !== undefined && seed !== null) ksNodes[0][1].inputs.seed = seed;
++    }
++    // 输出前缀
++    const saveNodes = Object.entries(p).filter(([, n]) => n.class_type === 'SaveImage');
++    const prefix = filename_prefix || 'qq_' + Date.now().toString(36);
++    if (saveNodes.length > 0) saveNodes[0][1].inputs.filename_prefix = prefix;
++    // 提交
++    const res = await comfyPost('/prompt', wf);
++    const pid = res?.prompt_id;
++    if (!pid) throw new Error('ComfyUI 提交失败: ' + JSON.stringify(res).slice(0, 300));
++    // 轮询
++    for (let i = 0; i < 120; i++) {
++        await new Promise(r => setTimeout(r, 2000));
++        try {
++            const hist = await comfyGet('/history/' + pid, 30000);
++            const entry = hist[pid];
++            if (!entry) continue;
++            const statusStr = entry.status?.status_str;
++            if (statusStr === 'success' || entry.status?.completed) {
++                for (const [, out] of Object.entries(entry.outputs || {})) {
++                    for (const img of out.images || []) {
++                        const p2 = join(COMFYUI_OUT, img.subfolder || '', img.filename);
++                        if (existsSync(p2)) return { image_path: p2, filename: img.filename };
++                    }
++                }
++                throw new Error('出图成功但找不到文件');
++            }
++            if (statusStr === 'error') throw new Error('ComfyUI 生成错误: ' + JSON.stringify(entry).slice(0, 400));
++        } catch (e) {
++            if (e.message?.includes('HTTP')) continue; // 轮询瞬时错误重试
++            throw e;
++        }
++    }
++    throw new Error('生图超时(240s)');
++}
++
++/** 从 stickers 目录选一个表情包(按情绪关键词匹配文件名) */
++function pickSticker(emotion) {
++    if (!existsSync(STICKER_DIR)) return undefined;
++    const files = readdirSync(STICKER_DIR).filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f));
++    if (files.length === 0) return undefined;
++    // 情绪关键词 → 文件名子串匹配
++    const kw = {
++        '开心': ['haha', 'xiao', 'happy', 'fun', 'kuaile'],
++        '惊讶': ['jing', 'wow', 'shock', 'surprise', 'yajing'],
++        '无语': ['wuyu', 'speechless', 'no', 'tucao'],
++        '可爱': ['keai', 'cute', 'meng', 'kawayi'],
++        '难过': ['nanguo', 'cry', 'sad', 'ku'],
++        '加油': ['jiayou', 'fighting', 'go', 'cheer'],
++        '赞': ['zan', 'good', 'great', 'like', 'dianzan'],
++    };
++    const keys = kw[emotion] || [];
++    const hit = files.find(f => keys.some(k => f.toLowerCase().includes(k)));
++    return hit ? join(STICKER_DIR, hit) : join(STICKER_DIR, files[0]);
++}
++
++/** 注册三个工具 */
++export function registerGroupTools(ctx, sender, manager, logger) {
++    // 解析当前应发往的群: 找 manager.sessions 里最近活跃的 group 会话的 replyTarget
++    function resolveGroupTarget() {
++        try {
++            const sessions = manager.sessions;
++            let best = null;
++            for (const record of sessions.values()) {
++                if (record.scope === 'group' && record.replyTarget) {
++                    if (!best || (record.lastActiveAt || 0) > (best.lastActiveAt || 0)) best = record;
++                }
++            }
++            if (best?.replyTarget) {
++                // [local-patch 2026-08-20 P2-16] 持久化 target, 供 headless 定时任务(主动发送)读取
++                try {
++                    writeFileSync('C:/Users/<USER>/.dsh/<WORK_DIR>/last_group_target.json',
++                        JSON.stringify({ scope: 'group', targetId: best.replyTarget.targetId, ts: Date.now() }));
++                } catch { /* best effort */ }
++                return best.replyTarget;
++            }
++            // [local-patch 2026-08-20 P2-16] 内存无会话时读持久化文件(headless 场景)
++            try {
++                const saved = JSON.parse(readFileSync('C:/Users/<USER>/.dsh/<WORK_DIR>/last_group_target.json', 'utf-8'));
++                if (saved?.scope && saved?.targetId) return { scope: saved.scope, targetId: saved.targetId };
++            } catch { /* 无持久化记录 */ }
++            // 兜底: 任意 group record 的 peerId
++            for (const record of sessions.values()) {
++                if (record.scope === 'group' && record.peerId) {
++                    return { scope: 'group', targetId: record.peerId };
++                }
++            }
++            return undefined;
++        } catch { return undefined; }
++    }
++    const tools = [
++        {
++            name: 'comfyui_generate',
++            description: '调用本地 ComfyUI 生成图片(写实 Z-Image/二次元 Illustrious/参考图 FLUX)。返回图片本地路径, 之后必须用 send_image 发到群里。出图约 20-60 秒。',
++            parameters: {
++                type: 'object',
++                additionalProperties: false,
++                properties: {
++                    prompt: { type: 'string', description: '中文提示词, 详细描述画面(主体/场景/光线/色彩/风格)' },
++                    negative_prompt: { type: 'string', description: '负面词, 人像建议 bad hands, extra fingers' },
++                    width: { type: 'integer', description: '宽度, 默认 1024' },
++                    height: { type: 'integer', description: '高度, 默认 1024' },
++                    steps: { type: 'integer', description: '采样步数, Z-Image 8-12, Illustrious 28' },
++                    seed: { type: 'integer', description: '随机种子(固定可复现)' },
++                    filename_prefix: { type: 'string', description: '输出文件名前缀(拼音/英文)' },
++                    model: { type: 'string', description: 'z-image(默认)/illustrious/flux' },
++                },
++                required: ['prompt'],
++            },
++            output: {
++                schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
++                render: (_args, value) => [{ type: 'text', text: value.text || '' }],
++            },
++            async execute(args) {
++                const r = await generateImage(args);
++                return { text: `✅ 图片已生成: ${r.image_path}\n请调用 send_image 工具把它发到群里, 参数 image_path="${r.image_path}"` };
++            },
++        },
++        {
++            name: 'send_image',
++            description: '把本地图片文件发送到当前群聊/私聊。图片路径来自 comfyui_generate 或群友发的图片。',
++            parameters: {
++                type: 'object',
++                additionalProperties: false,
++                properties: {
++                    image_path: { type: 'string', description: '图片文件的绝对路径' },
++                    caption: { type: 'string', description: '随图发送的文字说明' },
++                },
++                required: ['image_path'],
++            },
++            output: {
++                schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
++                render: (_args, value) => [{ type: 'text', text: value.text || '' }],
++            },
++            async execute(args) {
++                const p = args.image_path;
++                if (!p || !existsSync(p)) throw new Error('图片不存在: ' + p);
++                const target = resolveGroupTarget();
++                if (!target) return { text: '找不到当前群会话, 无法发送图片' };
++                try {
++                    await sender.sendImage(target, { localPath: p });
++                    return { text: '✅ 图片已发送到群聊' };
++                } catch (e) {
++                    return { text: `图片发送失败: ${e?.message || e}` };
++                }
++            },
++        },
++        {
++            name: 'sticker_send',
++            description: '发送一个表情包到群里(从收藏的表情包里按情绪匹配)。表达情感时使用。',
++            parameters: {
++                type: 'object',
++                additionalProperties: false,
++                properties: {
++                    emotion: { type: 'string', description: '情绪: 开心/惊讶/无语/可爱/难过/加油/赞' },
++                },
++                required: ['emotion'],
++            },
++            output: {
++                schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
++                render: (_args, value) => [{ type: 'text', text: value.text || '' }],
++            },
++            async execute(args) {
++                const p = pickSticker(args.emotion);
++                if (!p) return { text: '还没有合适的表情包收藏~ 群友发一个有趣的图, Yuro 收藏后就能用了' };
++                const target = resolveGroupTarget();
++                if (!target) return { text: '找不到当前群会话, 无法发送表情包' };
++                try {
++                    await sender.sendImage(target, { localPath: p });
++                    return { text: `✅ 表情包已发送 (${args.emotion})` };
++                } catch (e) {
++                    return { text: `表情包发送失败: ${e?.message || e}` };
++                }
++            },
++        },
++        // [local-patch 2026-08-20 P2-16] 主动发消息工具: 到点任务(起床/睡眠通知)用
++        {
++            name: 'proactive_send',
++            description: '主动发送一条文本消息到当前群聊(不等待群友回复)。用于定时任务(如早 8 点起床问候、睡前道晚安)。',
++            parameters: {
++                text: { type: 'string', required: true, description: '要发送的消息内容' },
++            },
++            output: {
++                schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
++                render: (_args, value) => [{ type: 'text', text: value.text || '' }],
++            },
++            async execute(args) {
++                const target = resolveGroupTarget();
++                if (!target) return { text: '找不到当前群会话, 无法主动发送' };
++                try {
++                    await sender.sendMarkdown(target, String(args.text));
++                    return { text: '✅ 消息已主动发送到群聊' };
++                } catch (e) {
++                    return { text: `主动发送失败: ${e?.message || e}` };
++                }
++            },
++        },
++    ];
++    for (const tool of tools) {
++        ctx.effect(() => ctx.tools.register(tool), `im-qqbot: ${tool.name} tool`);
++    }
++    logger.info('[im-qqbot] group tools registered: comfyui_generate, send_image, sticker_send');
++}
+@@ -210,7 +210,7 @@
+                 type: 'object',
+                 additionalProperties: false,
+                 properties: {
+-                    prompt: { type: 'string', description: '中文提示词, 详细描述画面(主体/场景/光线/色彩/风格)' },
++                    prompt: { type: 'string', description: '提示词。direct=true 时=群友原话逐字保留(不扩写不翻译, 中英文都原样); direct=false 时=你自己组织的详细画面描述(主体/场景/光线/色彩/风格)' },
+                     negative_prompt: { type: 'string', description: '负面词, 人像建议 bad hands, extra fingers' },
+                     width: { type: 'integer', description: '宽度, 默认 1024' },
+                     height: { type: 'integer', description: '高度, 默认 1024' },
+@@ -218,6 +218,7 @@
+                     seed: { type: 'integer', description: '随机种子(固定可复现)' },
+                     filename_prefix: { type: 'string', description: '输出文件名前缀(拼音/英文)' },
+                     model: { type: 'string', description: 'z-image(默认)/illustrious/flux' },
++                    direct: { type: 'boolean', description: '[2026-08-21 双模式] true=直传模式: 群友明确要求"直接用我的提示词/原样画/别改"时用, prompt 填群友原话逐字保留; false(默认)=Yuro 代画: 理解群友需求后自己组织提示词' },
+                 },
+                 required: ['prompt'],
+             },
+diff --git a/dist/index.js b/dist/index.js
+index 4d4385aa7cc9d35b4b3cc1bfff03443fc3bbf51c..a77e30906fb873c2abedced57e1e394a7697d709 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -4,7 +4,7 @@ import { getProfileDir, resolveEnv } from './shared/index.js';
+ import { runQrSetup, persistCredentialsToProfile } from './setup.js';
+ // ── Cordis 插件元数据 ──
+ export const name = 'im-qqbot';
+-export const inject = ['agents'];
++export const inject = ['agents', 'tools']; // [local-patch 2026-08-20 P2-11] 注入 tools 服务(注册生图/表情包工具)
+ export const Config = ConfigSchema;
+ // ── 插件主体 ──
+ export async function apply(ctx, config) {
+diff --git a/dist/model/settings-reader.js b/dist/model/settings-reader.js
+index f28c2202f84c9fbd7301ce77237d4a38d41a8e11..0f482b15619003c262ee7c7a1ecac4cfc1b3afcc 100644
+--- a/dist/model/settings-reader.js
++++ b/dist/model/settings-reader.js
+@@ -4,13 +4,15 @@
+  * 从 ~/.dsh/settings.yaml 中读取模型配置信息。
+  * 只读，不修改 settings.yaml。
+  */
+-import { readFileSync, existsSync } from 'node:fs';
++import { readFileSync, existsSync, statSync } from 'node:fs';
+ import { resolve } from 'node:path';
+ import { homedir } from 'node:os';
+ import yaml from 'js-yaml';
+ export class SettingsReader {
+-    /** settings.yaml 缓存 */
++    /** settings.yaml 缓存（[local-patch 2026-08-18] 带 mtime 失效，热重载生效） */
+     settingsCache;
++    /** 缓存对应的文件 mtime */
++    settingsMtime;
+     /**
+      * 从 settings.yaml 的 agent-default-model 字段读取默认模型路由
+      */
+@@ -54,17 +56,24 @@ export class SettingsReader {
+         const llmPiAi = settings?.['llm-pi-ai'];
+         return llmPiAi?.providers ? Object.keys(llmPiAi.providers) : [];
+     }
++    // [local-patch 2026-08-18] 缓存失效: 每次比较文件 mtime, settings.yaml 热重载后
++    // 下次读取即用新值(修复"QQ 会话模型切换不生效"——原实现永久缓存启动时快照)
+     loadSettings() {
+-        if (this.settingsCache !== undefined)
++        const settingsPath = resolve(homedir(), '.dsh', 'settings.yaml');
++        let mtime = 0;
++        try {
++            mtime = statSync(settingsPath).mtimeMs;
++        }
++        catch {
++            this.settingsCache = null;
++            return null;
++        }
++        if (this.settingsCache !== undefined && this.settingsMtime === mtime)
+             return this.settingsCache;
+         try {
+-            const settingsPath = resolve(homedir(), '.dsh', 'settings.yaml');
+-            if (!existsSync(settingsPath)) {
+-                this.settingsCache = null;
+-                return null;
+-            }
+             const content = readFileSync(settingsPath, 'utf8');
+             this.settingsCache = yaml.load(content);
++            this.settingsMtime = mtime;
+             return this.settingsCache;
+         }
+         catch {
+diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
+index 420cf14908d056fa27aed8c0259b6b73114fe7e4..ceea0a05e9a63b6819dbf812c8cb8ece2f70d050 100644
+--- a/dist/session/session-manager.js
++++ b/dist/session/session-manager.js
+@@ -13,6 +13,7 @@
+  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
+  */
+ import { createHash, randomUUID } from 'node:crypto';
++import { writeFileSync, readdirSync, existsSync, rmSync } from 'node:fs'; // [local-patch] last-peer/磁盘重置
+ import { SessionId } from '@deepseek-ai/dsh-session';
+ import { ModelResolver } from '../model/model-resolver.js';
+ import { IdleEvictor } from './idle-evictor.js';
+@@ -83,12 +84,15 @@ export class SessionManager {
+             return;
+         }
+         const childId = SessionId(randomUUID());
+-        const composed = await this.composePreset(this.config.preset);
++        // [local-patch 2026-08-18 P2-6] 分级 preset: 群聊切模型也挂受限 preset(原用 config.preset 一律 standard)
++        const presetId = scope === 'group' ? 'qq-group-restricted' : (this.config.preset ?? 'standard');
++        const composed = await this.composePreset(presetId);
+         const created = await this.agents.create({
+             sessionId: childId,
+             seed,
+             meta: {
+-                cwd: this.config.cwd || process.cwd(),
++                // [local-patch 2026-08-19 P2-9] 群聊工作区隔离: group 会话独立 cwd(<WORK_DIR>)
++                cwd: scope === 'group' ? 'C:/Users/<USER>/.dsh/<WORK_DIR>' : (this.config.cwd || process.cwd()),
+                 parentSession: record.sessionId,
+                 seedLength: seed.length,
+                 ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
+@@ -189,7 +193,11 @@ export class SessionManager {
+         return `qqbot:${this.config.appId}:${scope}:${peerId}`;
+     }
+     deriveSessionId(sessionKey) {
+-        const hash = createHash('sha256').update(sessionKey).digest('hex');
++        // [local-patch 2026-08-18 P2-7] 命名空间隔离: QQ 会话与 web 会话彻底分离。
++        // 原实现直接哈希 sessionKey, 生成的 UUID 与 web 端随机 UUID 撞上会共享同一会话
++        // (实测 7732eb9c = web+QQ 双通道同会话, web 操作刷 QQ, /bot-reset 互相删历史)。
++        // 加固定命名空间前缀后 QQ 会话 id 变为稳定新值, 与 web 会话不再重合。
++        const hash = createHash('sha256').update(`qqbot-peer:${sessionKey}`).digest('hex');
+         return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+     }
+     currentSessionId(sessionKey) {
+@@ -223,6 +231,10 @@ export class SessionManager {
+     /** 获取或恢复或创建会话（get → resume → create） */
+     async getOrCreate(scope, peerId, senderId, replyTarget) {
+         const key = this.sessionKey(scope, peerId);
++        // [local-patch 2026-08-17 debug] 全链路诊断
++        const t0 = Date.now();
++        const dbg = (msg) => console.log(`[im-qqbot] [getOrCreate] ${msg} key=${key.slice(0, 60)} ${Date.now() - t0}ms`);
++        dbg('enter');
+         const existing = this.sessions.get(key);
+         if (existing) {
+             existing.replyTarget = replyTarget;
+@@ -230,8 +242,14 @@ export class SessionManager {
+             return existing;
+         }
+         const route = this.modelResolver.getEffectiveRoute(key);
++        // [local-patch 2026-08-19 P2-9] 群聊默认模型 mimo-v2.5（双人格独立模型路由）
++        // 群聊会话优先用配置的 groupModel（走 new-api 网关，mimo-v2.5 已授权），
++        // 无 per-peer 偏好时生效；私聊保持原路由不受影响。
++        const effectiveRoute = (scope === 'group' && this.config.groupProvider && this.config.groupModel && !this.modelResolver.hasOverride(key))
++            ? { provider: this.config.groupProvider, model: this.config.groupModel }
++            : route;
+         const sessionId = SessionId(this.currentSessionId(key));
+-        this.logger.info(`getOrCreate: key=${key} route=${route ? `${route.provider}/${route.model}` : 'host-default'} sessionId=${sessionId}`);
++        this.logger.info(`getOrCreate: key=${key} route=${effectiveRoute ? `${effectiveRoute.provider}/${effectiveRoute.model}` : 'host-default'} sessionId=${sessionId}`);
+         let agent;
+         let handle;
+         let agentPreset;
+@@ -241,28 +259,42 @@ export class SessionManager {
+             this.logger.info(`reusing live agent: key=${key}`);
+         }
+         else {
++            // [local-patch 2026-08-17] 分级 preset：群聊=受限 preset（无 shell/子代理，受监督）；
++            // 私聊=配置 preset 或 standard
++            const presetId = scope === 'group'
++                ? 'qq-group-restricted'
++                : (this.config.preset ?? 'standard');
+             // preset 只解析一次：resume/create 共用同一组合，避免重复 resolve/mount 目录
+-            const composed = await this.composePreset(this.config.preset);
++            const composed = await this.composePreset(presetId);
+             agentPreset = composed.agentPreset;
++            dbg(`composed preset=${presetId}`);
+             try {
++                // [local-patch 2026-08-19 P2-9] 群聊 resume 也用 group 默认路由
+                 const resumeRoute = this.modelResolver.getResumeRoute(key);
++                const effectiveResumeRoute = (scope === 'group' && this.config.groupProvider && this.config.groupModel && !this.modelResolver.hasOverride(key))
++                    ? { provider: this.config.groupProvider, model: this.config.groupModel }
++                    : resumeRoute;
++                dbg(`resume begin route=${effectiveResumeRoute ? effectiveResumeRoute.provider + '/' + effectiveResumeRoute.model : 'none'}`);
+                 const resumed = await this.agents.resume({
+                     resumeSessionId: sessionId,
+-                    ...(resumeRoute ? { agentOptions: resumeRoute } : {}),
++                    ...(effectiveResumeRoute ? { agentOptions: effectiveResumeRoute } : {}),
+                     ...(composed.setup ? { setup: composed.setup } : {}),
+                 });
+                 agent = resumed.agent;
+                 handle = resumed;
+-                this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${resumeRoute ? `${resumeRoute.provider}/${resumeRoute.model}` : 'session-own'}`);
++                this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${effectiveResumeRoute ? `${effectiveResumeRoute.provider}/${effectiveResumeRoute.model}` : 'session-own'}`);
++                dbg('resume done');
+             }
+-            catch {
++            catch (e) {
++                dbg(`resume failed -> create: ${e instanceof Error ? e.message : String(e)}`);
+                 const created = await this.agents.create({
+                     sessionId,
+                     meta: {
+-                        cwd: this.config.cwd || process.cwd(),
++                        // [local-patch 2026-08-19 P2-9] 群聊工作区隔离: group 会话独立 cwd(<WORK_DIR>)
++                        cwd: scope === 'group' ? 'C:/Users/<USER>/.dsh/<WORK_DIR>' : (this.config.cwd || process.cwd()),
+                         ...(agentPreset ? { agentPreset } : {}),
+                     },
+-                    ...(route ? { agentOptions: route } : {}),
++                    ...(effectiveRoute ? { agentOptions: effectiveRoute } : {}),
+                     ...(composed.setup ? { setup: composed.setup } : {}),
+                 });
+                 agent = created.agent;
+@@ -282,7 +314,25 @@ export class SessionManager {
+             lastActivity: Date.now(),
+             agentPreset,
+         };
++        // [local-patch 2026-08-17] 分级权限: c2c(私聊)=full-access 全权限; group(群聊)=qq-group 沙箱受限
++        // (workspace-write, 可写根=session cwd=~/.dsh/work; 免审批因群聊无审批UI)
++        try {
++            const permissionPresets = this.ctx.get('permissionPresets');
++            if (permissionPresets) {
++                const presetName = scope === 'c2c' ? 'full-access' : 'qq-group';
++                permissionPresets.set(agent.session, presetName);
++                this.logger.info(`permission preset applied: key=${key} scope=${scope} preset=${presetName}`);
++            }
++        }
++        catch (err) {
++            this.logger.warn(`permission preset failed: ${err instanceof Error ? err.message : String(err)}`);
++        }
+         this.sessions.set(key, record);
++        // [local-patch 2026-08-17 P2-1] 记录最后活跃 peer（供重连后主动通知；主动消息受平台限制，失败仅记录）
++        try {
++            writeFileSync('C:/Users/<USER>/.dsh/qqbot-last-peer.json', JSON.stringify({ scope, peerId, at: Date.now() }));
++        }
++        catch { /* 记录失败不影响主流程 */ }
+         return record;
+     }
+     findBySessionId(sessionId) {
+@@ -308,6 +358,27 @@ export class SessionManager {
+         this.modelResolver.clearSessionId(key);
+         record.agent.cancel({ kind: 'user' });
+         await record.handle.dispose().catch(() => { });
++        // [local-patch 2026-08-17] 彻底重置：删除磁盘会话文件（session.jsonl.zstd），
++        // 下次消息 resume 失败 → create 全新会话（零历史零缓存），真正"去缓存"
++        try {
++            const base = 'C:/Users/<USER>/.dsh/sessions';
++            const wsDirs = readdirSync(base, { withFileTypes: true });
++            let removed = 0;
++            for (const ws of wsDirs) {
++                if (!ws.isDirectory())
++                    continue;
++                const target = `${base}/${ws.name}/${record.sessionId}`;
++                if (existsSync(target)) {
++                    rmSync(target, { recursive: true, force: true });
++                    removed++;
++                }
++            }
++            if (removed > 0)
++                this.logger.info(`session files removed: ${record.sessionId} (${removed} workspace)`);
++        }
++        catch (err) {
++            this.logger.warn(`session file removal failed: ${err instanceof Error ? err.message : String(err)}`);
++        }
+         this.logger.info(`session removed: key=${key}`);
+     }
+     async disposeAll() {
+diff --git a/dist/transport/chunker.js b/dist/transport/chunker.js
+index fe0e88ba029527635b1f0d533dda803d29cc394a..adfab635271dff514cbc4d9c6c9bf5e2f291bed9 100644
+--- a/dist/transport/chunker.js
++++ b/dist/transport/chunker.js
+@@ -39,6 +39,17 @@ export function chunkMarkdownText(text, limit) {
+         }
+     };
+     const appendLine = (line) => {
++        // [local-patch 2026-08-17] 超长单行硬切：单行超过 limit 时按字符切分（QQ 单消息上限 ~5000）
++        if (line.length > limit) {
++            if (current) {
++                chunks.push(current);
++                current = '';
++            }
++            for (let i = 0; i < line.length; i += limit) {
++                chunks.push(line.slice(i, i + limit));
++            }
++            return;
++        }
+         if (!current) {
+             current = line;
+             return;
+diff --git a/dist/transport/events.js b/dist/transport/events.js
+index 0daa4115e2c69ea0ab83a2e78aaeec2bfdbf8e49..8c7c767fd3ddbbde58e79271df0ab6bb26845c56 100644
+--- a/dist/transport/events.js
++++ b/dist/transport/events.js
+@@ -12,9 +12,19 @@
+  */
+ export function parseEvent(raw) {
+     switch (raw.type) {
++        case 'turn/start': {
++            return { type: 'turn/start' };
++        }
+         case 'assistant/chunk': {
+             const chunk = raw.data.chunk;
+-            if (chunk === undefined || chunk.type !== 'text-delta' || !chunk.text)
++            if (chunk === undefined)
++                return undefined;
++            // [local-patch 2026-08-17] 支持 reasoning 流式块（思考过程可见）
++            if (chunk.type === 'reasoning-delta' && chunk.text)
++                return { type: 'reasoning/chunk', text: chunk.text };
++            if (chunk.type === 'block-start' && chunk.blockType === 'reasoning')
++                return { type: 'reasoning/start' };
++            if (chunk.type !== 'text-delta' || !chunk.text)
+                 return undefined;
+             return { type: 'assistant/chunk', text: chunk.text };
+         }
+@@ -49,14 +59,22 @@ export function parseEvent(raw) {
+  * 从 turn/end reason 提取错误信息
+  *
+  * 兼容三种形态：error（新格式）、failure（旧格式）、顶层 message/code（最旧格式）。
++ * [local-patch 2026-08-17 P0-2] 扩展非 error 结束种类：aborted / max-tokens / interrupted
+  */
+ export function extractTurnError(reason) {
+-    if (reason.kind !== 'error')
+-        return undefined;
+-    const detail = reason.error ?? reason.failure;
+-    return {
+-        code: detail?.code ?? reason.code ?? 'UNKNOWN',
+-        message: detail?.message ?? reason.message ?? 'unknown error',
+-    };
++    if (reason.kind === 'error') {
++        const detail = reason.error ?? reason.failure;
++        return {
++            code: detail?.code ?? reason.code ?? 'UNKNOWN',
++            message: detail?.message ?? reason.message ?? 'unknown error',
++        };
++    }
++    if (reason.kind === 'aborted')
++        return { code: 'ABORTED', message: '已中止（用户或系统取消）' };
++    if (reason.kind === 'max-tokens')
++        return { code: 'MAX_TOKENS', message: '输出超长被截断，可要求继续或 /bot-reset 重试' };
++    if (reason.kind === 'interrupted')
++        return { code: 'INTERRUPTED', message: '会话被中断，可 /bot-reset 重置' };
++    return undefined;
+ }
+ //# sourceMappingURL=events.js.map
+\ No newline at end of file
+diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
+index 2813c4c391df0ca8b3bef783a3c4380e2f212d31..e53fda736b349fb4e0470e226112bcdca9defc68 100644
+--- a/dist/transport/inbound.js
++++ b/dist/transport/inbound.js
+@@ -1,5 +1,7 @@
+ import { createUserMessage } from '@deepseek-ai/dsh-llm';
+ import { clearGroupHistory } from '../features/history-store.js';
++import { existsSync, readFileSync, statSync } from 'node:fs'; // [local-patch 2026-08-20 P2-13] 兴趣过滤
++import { spawnSync, spawn } from 'node:child_process'; // [local-patch 2026-08-20 P1-B] 图片描述缓存
+ // ── 主处理函数 ──
+ /**
+  * 处理 QQ 入站消息（已经过 SDK 中间件链）
+@@ -14,6 +15,29 @@ export async function handleInbound(rawMsg, manager, config, logger, state) {
+         targetId: peerId,
+         msgId: msg.messageId,
+     };
++    // [local-patch 2026-08-20 P2-15] 睡眠模式: 预算超限后 SLEEPING 标志存在 → 任何消息(含@)都不回复
++    const SLEEP_FLAG = 'C:/Users/<USER>/.dsh/<WORK_DIR>/SLEEPING';
++    if (existsSync(SLEEP_FLAG)) {
++        logger.debug(`[im-qqbot] sleeping (budget exhausted), skip: "${String(msg.content ?? '').slice(0, 40)}"`);
++        return;
++    }
++    // [local-patch 2026-08-20 P2-13/P2-14] 兴趣预检: 群聊未@消息先看兴趣关键词, 未命中直接跳过(省 token)
++    // 私聊(c2c)和@消息不过滤; 词库不中的模糊消息交给 LLM 语义判断(P2-14)
++    const wasMentioned = mwState.mention?.wasMentioned ?? false;
++    if (scope === 'group' && !wasMentioned) {
++        const im = interestMatch(msg);
++        if (im === false) {
++            logger.debug(`[im-qqbot] skip (not in interests): "${String(msg.content ?? '').slice(0, 60)}"`);
++            return;
++        }
++        if (im === 'llm') {
++            const llmHit = await interestMatchLLM(msg);
++            if (!llmHit) {
++                logger.debug(`[im-qqbot] skip (LLM: not in interests): "${String(msg.content ?? '').slice(0, 60)}"`);
++                return;
++            }
++        }
++    }
+     // ── 读取中间件已下载的文件（attachmentProcessor 写入 state.downloadedFiles） ──
+     const downloaded = mwState.downloadedFiles ?? [];
+     // ── 组装 agentBody（对齐 openclaw-qqbot body-assembler） ──
+@@ -27,6 +51,8 @@ export async function handleInbound(rawMsg, manager, config, logger, state) {
+         record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
+     }
+     catch (err) {
++        // [local-patch 2026-08-17 debug] console 输出进 dsh-web.log 便于诊断
++        console.error(`[im-qqbot] ERROR creating session: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+         logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
+         return;
+     }
+@@ -36,12 +62,19 @@ export async function handleInbound(rawMsg, manager, config, logger, state) {
+         content,
+         source: { kind: 'user' },
+     });
+-    record.agent.followup(message);
++    // [local-patch 2026-08-18 P2-5] followup 加 catch: fire-and-forget 的 Promise
++    // 若 reject 会变 unhandled rejection(Node 可能崩进程), 失败仅记日志
++    record.agent.followup(message).catch((err) => {
++        console.error(`[im-qqbot] followup failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
++    });
+     logger.info(`→ followup sent: key=${scope}:${peerId}`);
+     // 群消息回复后清空历史缓存（避免下次 @ 时重复组包，对齐 openclaw-qqbot dispatch）
+     if (scope === 'group') {
+         clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
+     }
++    // [local-patch 2026-08-17] fire-and-forget：立即返回释放中间件链（并发锁）。
++    // typing 持续改由 outbound 独立心跳（turn/start→turn/end 50s 刷新），
++    // 修复"await whenIdle 悬挂导致重启后消息排队无响应"的问题。
+ }
+ // ══════════════════════════════════════════════════════════════
+ // Body Assembly（对齐 openclaw-qqbot 5 层组装）
+@@ -108,4 +109,25 @@
+ /**
+  * Layer 4: 媒体元数据上下文
+  */
++// [local-patch 2026-08-20 P1-B] 图片描述缓存: 查缓存(同步毫秒级) + 未命中后台生成(fire-and-forget)
++const IMAGE_DESC_SCRIPT = 'C:/Users/<USER>/AppData/Local/<HERMES_SCRIPTS>/yuro_image_describe.py';
++function readImageDescription(filePath) {
++    try {
++        const r = spawnSync('python', [IMAGE_DESC_SCRIPT, '--read-cache-only', filePath], {
++            encoding: 'utf-8', timeout: 8000, windowsHide: true,
++        });
++        if (r.status === 0 && r.stdout && r.stdout.trim()) {
++            return r.stdout.trim().split('
+')[0];
++        }
++    }
++    catch { /* 查询失败走后台生成 */ }
++    try {
++        // 未命中(exit 2)或异常 → 后台生成缓存, 不阻塞消息处理; 同图下次命中
++        const p = spawn('python', [IMAGE_DESC_SCRIPT, filePath], {
++            windowsHide: true, stdio: 'ignore',
++        });
++        p.unref();
++    }
++    catch { /* 后台生成失败静默 */ }
++    return null;
++}
+ function buildDynamicCtx(msg, state, downloaded) {
+
+@@ -117,7 +138,15 @@
+     const images = msg.attachments.filter(a => a.content_type === 'image');
+     if (images.length > 0) {
++        // [local-patch 2026-08-20 P1-B] 优先注入图片描述(缓存命中时), 模型能看到图片内容而非死链接
++        const imgFiles = (downloaded ?? []).filter(f => typeof f === 'string' && /\.(jpe?g|png|webp|gif)$/i.test(f));
++        for (const f of imgFiles.slice(0, 3)) {
++            const desc = readImageDescription(f);
++            if (desc) {
++                lines.push(`- Image: ${desc}`);
++                break;
++            }
++        }
+         const urls = images.map(a => a.url).filter(Boolean);
+         if (urls.length > 0) {
+             lines.push(`- Images: ${urls.join(', ')}`);
+         }
+     }
+
+@@ -245,4 +278,104 @@ const SENDER_SHORT_ID_LEN = 8;
+ function shortSenderId(senderId) {
+     return senderId.slice(0, SENDER_SHORT_ID_LEN);
+ }
++// [local-patch 2026-08-20 P2-13] 兴趣预检: 命中 interests.md 关键词才放行
++const INTERESTS_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/interests.md';
++let _interestCache = null;
++let _interestMtime = 0;
++function loadInterests() {
++    try {
++        if (!existsSync(INTERESTS_FILE)) return [];
++        const st = statSync(INTERESTS_FILE);
++        if (_interestCache && st.mtimeMs === _interestMtime) return _interestCache;
++        const text = readFileSync(INTERESTS_FILE, 'utf-8');
++        const words = new Set();
++        // 只读"机器读取区": 标题行(## 兴趣关键词)之后、下一个标题(##)之前的纯词行
++        const lines = text.split('\n');
++        let inMachineZone = false;
++        for (const line of lines) {
++            const trimmed = line.trim();
++            if (trimmed.startsWith('## 兴趣关键词')) { inMachineZone = true; continue; }
++            if (inMachineZone && trimmed.startsWith('## ')) { inMachineZone = false; continue; }
++            if (!inMachineZone) continue;
++            // 纯词行: 非空、不含中文标点/箭头/破折号、长度 2-12
++            if (!trimmed || trimmed.length > 12) continue;
++            if (/[：:，。！？、→——""''（）()]/.test(trimmed)) continue;
++            if (trimmed.startsWith('#') || trimmed.startsWith('-') || trimmed.startsWith('*')) continue;
++            words.add(trimmed);
++        }
++        _interestCache = [...words];
++        _interestMtime = st.mtimeMs;
++        return _interestCache;
++    } catch { return []; }
++}
++function interestMatch(msg) {
++    // 有附件(图/文件/视频) → 命中(可能想看图/收藏表情包)
++    if (msg.attachments && msg.attachments.length > 0) return true;
++    const content = String(msg.content ?? '').trim();
++    if (!content) return false;
++    const words = loadInterests();
++    if (words.length === 0) return true; // 无兴趣文件时放行(保守)
++    const lower = content.toLowerCase();
++    // 阶段1a: 词库词直接命中(强信号) → 放行
++    if (words.some(w => w && lower.includes(w.toLowerCase()))) return true;
++    // 阶段1b: 同义词/子串扩展(降低漏判)
++    const SYNONYMS = [
++        ['动漫', '番剧', '动画', '漫画', '二次元', '新番'],
++        ['音乐', '歌曲', '歌手', '歌'],
++        ['美食', '火锅', '奶茶', '甜品', '好吃', '吃饭', '夜宵'],
++        ['可爱', '萌', '猫', '狗', '宠物'],
++        ['游戏', '打游戏', '开黑', '排位'],
++        ['AI', '机器人', '人工智能', 'gpt', '大模型'],
++        ['鲸鱼', '海洋', '海', '鱼'],
++    ];
++    if (SYNONYMS.some(group => group.some(g => lower.includes(g)))) return true;
++    // 阶段1c: 明显噪音(单字/纯表情/纯链接/无意义) → 跳过
++    if (content.length <= 1) return false;
++    if (/^[\s\S]{0,5}$/.test(content.replace(/\p{Emoji}/gu, ''))) return false;
++    // 阶段2: 交给 LLM 语义判断(异步, 在 handleInbound 里 await)
++    return 'llm'; // 标记需要 LLM 判断
++}
++// [local-patch 2026-08-20 P2-14] LLM 语义兴趣判断: 词库匹配不中的消息交给 mimo 判断
++// 用 yuro-pro key(进程环境变量 DSH_PRO_KEY), 轻量调用(max_tokens=10, 只回 yes/no)
++async function interestMatchLLM(msg) {
++    const content = String(msg.content ?? '').trim();
++    if (!content) return false;
++    const apiKey = process.env.DSH_PRO_KEY || '';
++    if (!apiKey) return false; // 无 key 时保守跳过(宁可少回复)
++    const words = loadInterests();
++    const interestsText = words.join('、') || '鲸鱼海洋、二次元动漫、美食、可爱事物、音乐、游戏、AI';
++    const prompt = `你是 Yuro 的"兴趣过滤器"。Yuro 的兴趣: ${interestsText}。
++判断这条群聊消息是否值得 Yuro 回复。以下情况都算 YES:
++1. 消息内容与兴趣相关(包括同义/相关话题, 如"露营""爬山"=旅行, "螺蛳粉""烧烤"=美食)
++2. 消息在向 Yuro 求助/互动(如"帮我""问你""Yuro")
++3. 消息有明显情绪想倾诉或求安慰
++消息:
++"${content.slice(0, 100)}"
++只回复 YES 或 NO。`;
++    try {
++        const ctrl = new AbortController();
++        const timer = setTimeout(() => ctrl.abort(), 8000);
++        const resp = await fetch('http://127.0.0.1:18081/v1/chat/completions', {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
++            body: JSON.stringify({
++                model: 'mimo-v2.5',
++                messages: [
++                    { role: 'system', content: '你是兴趣过滤器。只回复 YES 或 NO。' },
++                    { role: 'user', content: prompt },
++                ],
++                max_tokens: 50,
++                temperature: 0,
++                // [local-patch 2026-08-20 P2-14] mimo 默认 thinking enabled 会吃光 max_tokens → 关闭
++                thinking: { type: 'disabled' },
++            }),
++            signal: ctrl.signal,
++        });
++        clearTimeout(timer);
++        if (!resp.ok) return false;
++        const data = await resp.json();
++        const answer = (data?.choices?.[0]?.message?.content ?? '').trim().toUpperCase();
++        return answer.startsWith('YES');
++    } catch { return false; }
++}
+@@ -267,6 +267,16 @@
+ /**
+  * 组装 agentBody — AI 实际看到的完整上下文
+  */
++// [local-patch 2026-08-21 群身份识别] openid → 群名映射（group_names.json 可热插拔，改完无需重启）
++const GROUP_NAMES_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/group_names.json';
++function groupNameFor(peerId) {
++    if (!peerId) return '未知群';
++    try {
++        const m = JSON.parse(readFileSync(GROUP_NAMES_FILE, 'utf-8'));
++        if (m[peerId]) return m[peerId];
++    } catch { /* 文件缺失/损坏 → 用 openid 短标识 */ }
++    return `群${String(peerId).slice(0, 8)}`;
++}
+ function assembleAgentBody(msg, state, scope, logger, downloaded) {
+     const userContent = buildUserContent(msg, state, logger);
+     // [local-patch 2026-08-21 多模态修复] 纯图片消息(群聊 media 在 raw 字段)也要进 agent——合并判断
+@@ -284,6 +294,10 @@
+     const wasMentioned = state.mention?.wasMentioned ?? false;
+     const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
+     const dynamicCtx = buildDynamicCtx(msg, state, downloaded);
++    // [local-patch 2026-08-21 群身份识别] 每轮注入当前所在群（群消息）/私聊标识——让 bot 能识别两个群聊的区别
++    const placeTag = isGroup
++        ? `[当前群: ${groupNameFor(msg.groupOpenid ?? msg.senderId)}]`
++        : '[私聊]';
+     const base = `${placeTag}\n${dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage}`;
+     const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
+     return agentBody;
+@@ -294,11 +294,12 @@
+     const wasMentioned = state.mention?.wasMentioned ?? false;
+     const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
+     const dynamicCtx = buildDynamicCtx(msg, state, downloaded);
+-    // [local-patch 2026-08-21 群身份识别] 每轮注入当前所在群（群消息）/私聊标识——让 bot 能识别两个群聊的区别
++    // [local-patch 2026-08-21 群身份识别 v2] 只在会话第一条消息注入群标识(模型从历史记住群身份), 避免每轮顶着标记
++    const isFirstInSession = !state.history || state.history.length === 0;
+     const placeTag = isGroup
+         ? `[当前群: ${groupNameFor(msg.groupOpenid ?? msg.senderId)}]`
+         : '[私聊]';
+-    const base = `${placeTag}\n${dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage}`;
++    const base = `${isFirstInSession ? `${placeTag}\n` : ''}${dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage}`;
+     const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
+     return agentBody;
+ }
+@@ -3,6 +3,9 @@
+ import { existsSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs'; // [local-patch 2026-08-20 P2-13] 兴趣过滤
+ import { spawnSync, spawn } from 'node:child_process'; // [local-patch 2026-08-20 P1-B] 图片描述缓存
+ // ═══ [local-patch 2026-08-21 P3-4] 主人命令 + 作息静音 + 回复冷却 ═══
++// [local-patch 2026-08-21 /画图 命令直通] 群友 /画图 <提示词> → 直接 ComfyUI 生图发群（绕过 MiMo 文本生成/审核）
++import { generateImage } from '../group-tools.js';
++
+ const MASTER_OPENID = '__MASTER_OPENID__'; // 主人（owner）openid
+ const ROUTINE_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/routine_state.md';
+ const LAST_REPLY_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/last_reply.json';
+@@ -91,6 +94,33 @@
+     return null;
+ }
+ // 主人命令（仅主人的 senderId 触发；回复直接 sendMarkdown，不走 agent）
++// [local-patch 2026-08-21 /画图 命令直通] 群友 /画图 <提示词> → ComfyUI 直通生图（绕过 MiMo 文本生成/审核）
++// 核心: 提示词 = 群友原话逐字直传（无 LLM 翻译/加工）；60s 节流防刷屏
++let _drawLockAt = 0;
++function handleDrawCommand(msg, sender, replyTarget) {
++    const text = String(msg.content || '').replace(/<@[0-9A-F]+>/g, '').trim();
++    const m = text.match(/^\/画图[\s:：]*(.+)$/s);
++    if (!m) return false;
++    const prompt = m[1].trim();
++    if (!prompt || prompt.length > 500) return false;
++    const now = Date.now();
++    if (now - _drawLockAt < 60000) {
++        try { sender?.sendMarkdown(replyTarget, '⏳ 刚画完一张啦，歇口气再画嘛~').catch(() => {}); } catch { /* 尽力 */ }
++        return true;
++    }
++    _drawLockAt = now;
++    generateImage({ prompt, steps: 8 })
++        .then(async (r) => {
++            try { await sender.sendImage(replyTarget, { localPath: r.image_path }); }
++            catch (e) { console.error(`[im-qqbot] /画图 发图失败: ${e?.message || e}`); }
++        })
++        .catch((e) => {
++            console.error(`[im-qqbot] /画图 生图失败: ${e?.message || e}`);
++            try { sender?.sendMarkdown(replyTarget, `⚠️ 画图失败了：${(e?.message || String(e)).slice(0, 100)}`).catch(() => {}); } catch { /* 尽力 */ }
++        });
++    return true;
++}
++
+ function handleMasterCommand(msg, sender) {
+     const text = String(msg.content || '').replace(/<@[0-9A-F]+>/g, '').trim();
+     const target = msg.replyTarget;
+@@ -172,6 +202,11 @@
+     // [local-patch 2026-08-20 P2-15] 睡眠模式: 预算超限后 SLEEPING 标志存在 → 任何消息(含@)都不回复
+     if (existsSync(SLEEP_FLAG)) {
+         logger.debug(`[im-qqbot] sleeping (budget exhausted), skip: "${String(msg.content ?? '').slice(0, 40)}"`);
++        return;
++    }
++    // [local-patch 2026-08-21 /画图 命令直通] 群聊任何群友: /画图 <提示词> → 绕过 MiMo 直接生图发群
++    if (scope === 'group' && handleDrawCommand(msg, sender, replyTarget)) {
++        logger.info(`[im-qqbot] /画图 command: "${String(msg.content ?? '').slice(0, 60)}"`);
+         return;
+     }
+     // [local-patch 2026-08-21 P3-4] 主人命令: 仅主人的 senderId 触发, 直接回复不走 agent
+ //# sourceMappingURL=inbound.js.map
+\ No newline at end of file
+diff --git a/dist/transport/md-sanitizer.js b/dist/transport/md-sanitizer.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ed64f58b5a4c90e74c44b7d7d6b8b40e2a23d64
+--- /dev/null
++++ b/dist/transport/md-sanitizer.js
+@@ -0,0 +1,117 @@
++/**
++ * QQ markdown 方言降级器 [local-patch 2026-08-17 P1-5]
++ *
++ * QQ 机器人 markdown 消息支持的语法有限（官方：加粗/斜体/链接/行内代码/代码块/引用/列表/标题），
++ * 不支持 GFM 表格与图片。本模块在 sendMarkdown 前把不兼容语法降级为 QQ 可渲染形式：
++ *  - GFM 表格 → 键值列表（`key: value` 逐行）
++ *  - 图片 ![...](url) → 链接文本 [描述](url)（QQ 不支持 markdown 图片；图片另有 sendImage 通道）
++ *  - 代码块保持（QQ 支持），但过长时截断 + 提示
++ */
++
++/** 表格分隔行（|---|） */
++const TABLE_SEPARATOR = /^\s*\|?[\s:|-]+\|?\s*$/;
++/** 表格数据行 */
++const TABLE_ROW = /^\s*\|(.+)\|\s*$/;
++
++/**
++ * 把一行 GFM 表格行解析为单元格数组（去空白、去转义管道符）
++ */
++function splitCells(line) {
++    const body = line.trim().replace(/^\||\|$/g, '');
++    return body.split('|').map((c) => c.trim().replace(/\\([|])/g, '$1'));
++}
++
++/**
++ * 降级文本中的 GFM 表格为键值列表。
++ * 逐行扫描：连续表格行（含分隔行）聚合成块 → 表头+首行数据转 `k: v` 键值列表。
++ */
++export function downgradeTables(text) {
++    const lines = text.split('\n');
++    const out = [];
++    let tableBlock = [];
++    const flush = () => {
++        if (tableBlock.length === 0)
++            return;
++        // 过滤分隔行，取表头 + 最多 3 行数据
++        const rows = tableBlock.filter((l) => !TABLE_SEPARATOR.test(l)).slice(0, 4);
++        tableBlock = [];
++        if (rows.length === 0)
++            return;
++        const headers = splitCells(rows[0]);
++        const dataRows = rows.slice(1);
++        if (dataRows.length === 0) {
++            out.push(headers.join(' / '));
++            return;
++        }
++        for (const row of dataRows) {
++            const cells = splitCells(row);
++            const pairs = headers.map((h, i) => `${h}: ${cells[i] ?? ''}`).filter((p) => !p.endsWith(': '));
++            out.push(pairs.join(' ｜ '));
++        }
++        if (tableBlock.length > 4) {
++            out.push(`…（共 ${tableBlock.length - 1} 行数据，表格已折叠）`);
++        }
++    };
++    for (const line of lines) {
++        if (TABLE_ROW.test(line)) {
++            tableBlock.push(line);
++            continue;
++        }
++        flush();
++        out.push(line);
++    }
++    flush();
++    return out.join('\n');
++}
++
++/** 行内图片 ![...](url) → [描述](url) */
++export function downgradeImages(text) {
++    return text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) => `[${alt || '图片'}](${url})`);
++}
++
++/**
++ * 长代码块截断：代码块总长 > 1200 字符时截断并附提示（QQ 单消息预算有限）
++ */
++export function truncateLongCodeBlocks(text, maxCodeChars = 1200) {
++    const lines = text.split('\n');
++    const out = [];
++    let inCode = false;
++    let codeBuf = [];
++    const flushCode = () => {
++        if (codeBuf.length === 0)
++            return;
++        const joined = codeBuf.join('\n');
++        codeBuf = [];
++        if (joined.length <= maxCodeChars) {
++            out.push(joined);
++            return;
++        }
++        // 截断到最近换行
++        let cut = joined.slice(0, maxCodeChars);
++        const lastNl = cut.lastIndexOf('\n');
++        if (lastNl > maxCodeChars * 0.5)
++            cut = cut.slice(0, lastNl);
++        out.push(`${cut}\n…（代码过长已截断，共 ${joined.length} 字符）`);
++    };
++    for (const line of lines) {
++        if (/^```/.test(line)) {
++            flushCode();
++            inCode = !inCode;
++            out.push(line);
++            continue;
++        }
++        if (inCode) {
++            codeBuf.push(line);
++        }
++        else {
++            out.push(line);
++        }
++    }
++    flushCode();
++    return out.join('\n');
++}
++
++/** 完整降级管线（顺序：表格 → 图片 → 长代码块） */
++export function sanitizeForQQ(text) {
++    return truncateLongCodeBlocks(downgradeImages(downgradeTables(text)));
++}
+diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
+index 30d89df80889737a85784d0728b35bf9264b5d68..8afe483adc1d3f8e603b88b0f44dd8786b3dd6a9 100644
+--- a/dist/transport/outbound.js
++++ b/dist/transport/outbound.js
+@@ -1,4 +1,6 @@
+ import { chunkMarkdownText } from './chunker.js';
++import { sanitizeForQQ } from './md-sanitizer.js'; // [local-patch 2026-08-17 P1-5]
++import { readFileSync } from 'node:fs'; // [local-patch 2026-08-17] 群聊监督 last-peer 读取
+ import { OutboundBuffer } from './outbound-buffer.js';
+ import { formatToolResult } from './tool-presenter.js';
+ import { parseEvent, extractTurnError, } from './events.js';
+@@ -5,2 +7,9 @@
+ /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
+ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
++// [local-patch 2026-08-20 P3-3] Yuro 人设占位提示（鲸鱼女仆风格，随机切换更拟人）
++const YURO_NOTICES = [
++    '🐳 收到啦！让 Yuro 想想喵~',
++    '🐳 稍等一下下，Yuro 正在努力中！',
++    '🐳 好嘞～Yuro 琢磨琢磨再回你哦',
++    '🐳 鲸鱼小姐开始工作啦，稍等哦！',
++];
+@@ -15,6 +17,10 @@ class OutboundRouter {
+     toolsRegistry;
+     buffers = new Map();
+     toolCalls = new Map();
++    // [local-patch 2026-08-17] 思考过程缓冲（reasoning 块累积，assistant/message 时发摘要）
++    reasoningBuffers = new Map();
++    _superviseAt = 0;
++    _toolNoticeAt = 0;
+     constructor(manager, bot, config, logger, toolsRegistry) {
+         this.manager = manager;
+         this.bot = bot;
+@@ -31,6 +37,13 @@ class OutboundRouter {
+         if (record === undefined)
+             return;
+         switch (event.type) {
++            case 'turn/start':
++                this.onTurnStart(record, event);
++                break;
++            case 'reasoning/start':
++            case 'reasoning/chunk':
++                this.onReasoning(session.header.id, event);
++                break;
+             case 'assistant/chunk':
+                 this.onChunk(session.header.id, record, event);
+                 break;
+@@ -38,7 +51,7 @@ class OutboundRouter {
+                 this.onMessage(session.header.id, record, event);
+                 break;
+             case 'tool/call':
+-                this.onToolCall(event);
++                this.onToolCall(record, event);
+                 break;
+             case 'tool/result':
+                 this.onToolResult(record, event);
+@@ -48,6 +61,41 @@ class OutboundRouter {
+                 break;
+         }
+     }
++    /** [local-patch 2026-08-17 P1-2] 群聊占位提示 + C2C typing 独立心跳（不占中间件链） */
++    onTurnStart(record, event) {
++        const key = `${record.scope}:${record.peerId}`;
++        if (record.scope === 'group') {
++            const now = Date.now();
++            const last = this._groupNoticeAt?.get(key) ?? 0;
++            // 限流：同一群 30s 内只发一条占位，避免刷屏
++            if (now - last < 30000)
++                return;
++            (this._groupNoticeAt ??= new Map()).set(key, now);
++            void this.send(record, YURO_NOTICES[Math.floor(Math.random() * YURO_NOTICES.length)], 'sendGroupNotice');
++            return;
++        }
++        // C2C：typing 心跳（50s 刷新，覆盖整个生成期；turn/end 停止）
++        if (record.replyTarget?.msgId && !this._typingTimers?.has(key)) {
++            const timer = setInterval(() => {
++                this.bot.sendTyping?.(record.replyTarget).catch(() => { /* typing 失败静默 */ });
++            }, 50000);
++            (this._typingTimers ??= new Map()).set(key, timer);
++            // 首帧立即发一次
++            this.bot.sendTyping?.(record.replyTarget).catch(() => {});
++        }
++    }
++    /** [local-patch 2026-08-17] turn/end 停止 typing 心跳 */
++    // [local-patch 2026-08-18 P2-4] 修复 key 不匹配导致的 timer 泄漏:
++    // 原实现存 key=scope:peerId 却用 sessionId 查, 永不命中 → 每个 c2c 会话留下
++    // 永久 50s 定时器(无界增长)。改用 record 构造同一 key。
++    stopTyping(record) {
++        const key = `${record.scope}:${record.peerId}`;
++        const timer = this._typingTimers?.get(key);
++        if (timer) {
++            clearInterval(timer);
++            this._typingTimers.delete(key);
++        }
++    }
+     /** 流式文本增量：累积到会话 buffer */
+     onChunk(sessionId, record, event) {
+         let buffer = this.buffers.get(sessionId);
+@@ -63,6 +111,18 @@ class OutboundRouter {
+             && record.replyTarget.scope === 'c2c'
+             && !!record.replyTarget.msgId;
+     }
++    /** [local-patch 2026-08-17] 思考过程累积（上限 2000 字，防消息膨胀） */
++    onReasoning(sessionId, event) {
++        if (event.type === 'reasoning/start') {
++            this.reasoningBuffers.set(sessionId, '');
++            return;
++        }
++        let buf = this.reasoningBuffers.get(sessionId) ?? '';
++        buf += event.text;
++        if (buf.length > 2000)
++            buf = buf.slice(-2000);
++        this.reasoningBuffers.set(sessionId, buf);
++    }
+     /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
+     onMessage(sessionId, record, event) {
+         const buffer = this.buffers.get(sessionId);
+@@ -79,12 +139,46 @@ class OutboundRouter {
+         const fullText = textParts.join('\n');
+         if (!fullText.trim())
+             return;
++        // [local-patch 2026-08-17] 思考摘要前置（引用块模拟折叠感；QQ markdown 无代码块）
++        const reasoning = this.reasoningBuffers.get(sessionId);
++        this.reasoningBuffers.delete(sessionId);
++        if (reasoning?.trim() && this.config.showReasoning) {
++            const summary = reasoning.trim().slice(0, 400);
++            void this.send(record, `💭 **思考**\n> ${summary.replace(/\n/g, '\n> ')}${reasoning.trim().length > 400 ? '\n> …（思考过长已折叠）' : ''}`, 'sendReasoning');
++        }
+         void this.send(record, fullText, 'sendMarkdown');
+         this.buffers.delete(sessionId);
+     }
+-    /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
+-    onToolCall(event) {
++    /** 工具调用：记录 + 群聊监督转发 + 工具步骤提示（体现多步） */
++    onToolCall(record, event) {
+         this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
++        if (record.scope === 'group')
++            this._notifySupervisor(record, event);
++        // [local-patch 2026-08-17] 工具步骤提示（私聊/群聊可见"正在做什么"，限流 3s）
++        if (this.config.showToolCalls) {
++            const now = Date.now();
++            if (now - this._toolNoticeAt >= 3000) {
++                this._toolNoticeAt = now;
++                void this.send(record, `🔧 正在执行: \`${event.name}\``, 'sendToolNotice');
++            }
++        }
++    }
++    /** [local-patch 2026-08-17] 群聊监督：工具调用摘要转发给上级（last-peer 的 c2c 用户），限流 5s/条 */
++    _notifySupervisor(record, event) {
++        const now = Date.now();
++        if (now - (this._superviseAt ?? 0) < 5000)
++            return;
++        this._superviseAt = now;
++        try {
++            const peer = JSON.parse(readFileSync('C:/Users/<USER>/.dsh/qqbot-last-peer.json', 'utf8'));
++            if (peer?.scope === 'c2c' && peer?.peerId) {
++                const args = String(event.arguments ?? '').slice(0, 150);
++                void this.bot.sendMarkdown({ scope: 'c2c', targetId: peer.peerId },
++                    `🛡️ **[群聊] 工具调用**\n\`${event.name}\`${args ? `\n\`${args}\`` : ''}`)
++                    .catch(() => { /* 监督通知失败静默 */ });
++            }
++        }
++        catch { /* last-peer 缺失则跳过 */ }
+     }
+     /** 工具结果：错误始终发送，成功结果按开关 */
+     onToolResult(record, event) {
+@@ -99,8 +193,12 @@ class OutboundRouter {
+             return;
++        // [local-patch 2026-08-20 P3-2] 群聊隐去工具结果消息(成功/失败均不发), 统一由最终回复呈现
++        if (record.scope === 'group')
++            return;
+         void this.send(record, text, 'sendToolResult');
+     }
+-    /** 轮次结束：清理 buffer，异常结束时告知用户 */
++    /** 轮次结束：清理 buffer，停止 typing 心跳，异常结束时告知用户 */
+     onTurnEnd(sessionId, record, event) {
++        this.stopTyping(record); // [local-patch 2026-08-17] typing 心跳停止 (P2-4: 传 record 修正 key)
+         const buffer = this.buffers.get(sessionId);
+         if (buffer !== undefined) {
+             if (buffer.text.trim()) {
+@@ -113,13 +208,25 @@ class OutboundRouter {
+         }
+         const failure = extractTurnError(event.reason);
+         if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
+-            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
++            // [local-patch 2026-08-17 P0-2] 非 error 结束也给用户反馈（aborted/max-tokens/interrupted）
++            let notice;
++            if (failure.code === 'ABORTED')
++                notice = '⏹️ 已中止';
++            else if (failure.code === 'MAX_TOKENS')
++                notice = `⚠️ ${failure.message}`;
++            else if (failure.code === 'INTERRUPTED')
++                notice = `⚠️ ${failure.message}`;
++            else
++                notice = `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`;
++            void this.send(record, notice, 'sendTurnEndError');
+         }
+         this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
+     }
+-    /** 统一发送：切分 + 逐 chunk 发送 + 错误记录 */
++    /** 统一发送：QQ 方言降级 → 切分 → 逐 chunk 发送 + 错误记录 */
+     async send(record, text, tag) {
+-        const chunks = chunkMarkdownText(text, this.config.textChunkLimit);
++        // [local-patch 2026-08-17 P1-5] QQ markdown 不支持表格/图片 → 降级后再切分
++        const sanitized = sanitizeForQQ(text);
++        const chunks = chunkMarkdownText(sanitized, this.config.textChunkLimit);
+         for (const chunk of chunks) {
+             try {
+                 await this.bot.sendMarkdown(record.replyTarget, chunk);
+@@ -6,13 +6,29 @@
+ import { parseEvent, extractTurnError, } from './events.js';
+ /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
+ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
+-// [local-patch 2026-08-20 P3-3] Yuro 人设占位提示（鲸鱼女仆风格，随机切换更拟人）
+-const YURO_NOTICES = [
+-    '🐳 收到啦！让 Yuro 想想喵~',
+-    '🐳 稍等一下下，Yuro 正在努力中！',
+-    '🐳 好嘞～Yuro 琢磨琢磨再回你哦',
+-    '🐳 鲸鱼小姐开始工作啦，稍等哦！',
++// [local-patch 2026-08-20 P3-3] 人设占位提示（随机切换更拟人）
++// [local-patch 2026-08-21] 按 bot 动态化: 读 bot_name.txt（Yuro→🐳 / Yume→🌙），蓝绿通用零分叉
++const NOTICE_TEMPLATES = [
++    '{emoji} 收到啦！让 {name} 想想喵~',
++    '{emoji} 稍等一下下，{name} 正在努力中！',
++    '{emoji} 好嘞～{name} 琢磨琢磨再回你哦',
++    '{emoji} {name} 开始工作啦，稍等哦！',
+ ];
++const NOTICE_FILE = 'C:/Users/<USER>/.dsh/<WORK_DIR>/bot_name.txt';
++let _botNameCache = null;
++function readBotName() {
++    if (_botNameCache) return _botNameCache;
++    try {
++        _botNameCache = readFileSync(NOTICE_FILE, 'utf-8').trim() || 'Yuro';
++    } catch { _botNameCache = 'Yuro'; }
++    return _botNameCache;
++}
++function pickNotice() {
++    const name = readBotName();
++    const emoji = name === 'Yume' ? '🌙' : '🐳';
++    const t = NOTICE_TEMPLATES[Math.floor(Math.random() * NOTICE_TEMPLATES.length)];
++    return t.replace('{name}', name).replace('{emoji}', emoji);
++}
+ /**
+  * 出站路由器：持有会话级状态，按事件类型分发到处理器
+  */
+@@ -84,7 +100,7 @@
+             if (now - last < 30000)
+                 return;
+             (this._groupNoticeAt ??= new Map()).set(key, now);
+-            void this.send(record, YURO_NOTICES[Math.floor(Math.random() * YURO_NOTICES.length)], 'sendGroupNotice');
++            void this.send(record, pickNotice(), 'sendGroupNotice');
+             return;
+         }
+         // C2C：typing 心跳（50s 刷新，覆盖整个生成期；turn/end 停止）
+@@ -87,7 +87,8 @@
+ }
+ 
+ /** 用 ComfyUI API 生图: 确保启动 → 改 workflow → 提交 → 轮询 → 返回图片绝对路径 */
+-async function generateImage({ prompt, negative_prompt, width, height, steps, seed, filename_prefix, model }) {
++// [local-patch 2026-08-21] 导出供 inbound.js /画图 命令直通复用（绕过 MiMo 文本生成）
++export async function generateImage({ prompt, negative_prompt, width, height, steps, seed, filename_prefix, model }) {
+     await ensureComfyUI(); // [local-patch 2026-08-20 P2-12] 未启动则自动拉起
+     if (!existsSync(COMFYUI_WF)) throw new Error('workflow 文件不存在: ' + COMFYUI_WF);
+     const wf = JSON.parse(readFileSync(COMFYUI_WF, 'utf-8'));

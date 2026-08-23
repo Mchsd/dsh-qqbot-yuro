@@ -1,0 +1,21 @@
+{
+  "name": "dsh-qqbot-yuro",
+  "version": "0.1.0",
+  "description": "Yuro 拟人化 QQ 群聊机器人插件：情绪/作息/画像/预算/识图/下载/技能自进化等能力，基于 DeepSeek Harness（DSH）qqbot 通道",
+  "type": "module",
+  "main": "index.js",
+  "private": false,
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "keywords": ["dsh", "dsh-plugin", "cordis", "qqbot", "yuro", "group-chat", "persona", "拟人化"],
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "config.js",
+    "tools/",
+    "scripts/",
+    "patches/",
+    "skills/"
+  ]
+}

@@ -1,0 +1,18 @@
+# 依赖与产物
+node_modules/
+__pycache__/
+*.pyc
+*.log
+
+# 本地敏感数据（任何情况下都不进仓库）
+*_state.json
+routine_state.md
+energy_state.md
+emotion_state.md
+group_sleep_state.json
+last_group_target.json
+bot_name.txt
+group_names.json
+censor_log.jsonl
+announce.json
+saucenao.key
