@@ -22,6 +22,7 @@ export const DEFAULTS = {
   model: '<MODEL>',
   personaFile: null,
   skillsDir: null,
+  a2aBridgeDir: '',           // 可选：A2A 桥目录（含 a2a_bridge.py），配置后启用 yuro_a2a 工具
   scriptTimeoutMs: 60000,
   maxOutputChars: 4000,
 }

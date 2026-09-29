@@ -4,7 +4,7 @@
  * 统一注入 --bot <botName>（脚本侧消费配对，yuro_layers 分层）。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { runPython } from './spawn.js'
+import { runPython, runPythonRaw } from './spawn.js'
 
 const SCRIPT = {
   download: 'yuro_download.py',
@@ -15,6 +15,7 @@ const SCRIPT = {
   groupSleep: 'yuro_group_sleep.py',
   groupEnergy: 'yuro_group_energy.py',
   birthday: 'yuro_birthday.py',
+  a2a: 'yuro_a2a.py',
 }
 
 function jsonRender(_args, value) {
@@ -148,6 +149,21 @@ export function buildToolDefs(config) {
       output: { schema: { type: 'json' }, render: jsonRender },
       async execute(args) {
         return runPython(SCRIPT.birthday, botArgs(config, args.action || 'check'), config)
+      },
+    }),
+
+    defineTool({
+      name: 'yuro_a2a',
+      description: '与 Hermes(Merce) 进行 A2A 信封对话：把消息发给 Hermes 并返回她的回复。适合需要跨 agent 协作/询问 Hermes 时使用。需配置 a2aBridgeDir。',
+      parameters: {
+        message: { type: 'string', required: true, description: '要发给 Hermes 的消息内容' },
+        conversation: { type: 'string', description: '对话 ID（缺省 dsh-hermes-default，固定对话可延续上下文）' },
+      },
+      output: { schema: { type: 'json' }, render: jsonRender },
+      async execute(args) {
+        const a = [args.message]
+        if (args.conversation) a.push(args.conversation)
+        return runPythonRaw(SCRIPT.a2a, a, config, { timeoutMs: 320000 })
       },
     }),
   ]
