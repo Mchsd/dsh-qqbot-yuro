@@ -142,3 +142,19 @@ npx -p @deepseek-ai/dsh dsh plugin --profile qqbot add github:<your>/dsh-qqbot-y
 ## 📄 License
 
 [MIT](./LICENSE)。
+
+---
+
+## 📍 仓库定位（Yuro / Yume 项目族）
+
+本项目的代码与文档分散在 5 个仓库，各自职责边界如下：
+
+| 仓库 | 职责 | 可见性 |
+|---|---|---|
+| [`yuro_yume`](https://github.com/Mchsd/yuro_yume) | **项目正本**：理念、规格、研究文档 | 私有 |
+| [`y2-runtime`](https://github.com/Mchsd/y2-runtime) | 「推倒重做」后的运行时底座与最小骨架 | 私有 |
+| [`yuro-bot`](https://github.com/Mchsd/yuro-bot) | 功能与插件代码快照（不含人设与数据） | 私有 |
+| [`dsh-qqbot-yuro`](https://github.com/Mchsd/dsh-qqbot-yuro) | 对外发布的 DSH QQ 插件形态 | 公开 |
+| [`dsh-tool-yuro`](https://github.com/Mchsd/dsh-tool-yuro) | 工具层插件：脚本收敛为 `ctx.tools` | 私有 |
+
+> **本仓库定位**：**对外发布的插件形态**：本族中唯一公开的仓库，以 DSH cordis 插件形式发布 Yuro 的能力（含 `patches/` `skills/` `tools/`）。
