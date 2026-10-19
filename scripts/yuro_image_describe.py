@@ -518,6 +518,16 @@ def show_roles() -> None:
         print(ln)
 
 
+
+def _run_safe(fn, *a, **kw):
+    """异常安全入口：失败只打印一行错误并用 exit=2，避免 Traceback 塞回群聊工具输出。"""
+    try:
+        return fn(*a, **kw)
+    except Exception as e:
+        print(f'图片识别失败: {type(e).__name__}: {e}', file=sys.stderr)
+        sys.exit(2)
+
+
 if __name__ == '__main__':
     args = sys.argv[1:]
     if not args:
@@ -541,11 +551,11 @@ if __name__ == '__main__':
         else:
             sys.exit(2)  # 未命中: exit 2 供 inbound 判断
     elif args[0] == '--lite' and len(args) > 1:
-        print(describe_lite(args[1]))
+        print(_run_safe(describe_lite, args[1]))
     elif args[0] == '--batch' and len(args) > 1:
-        batch_describe(args[1])
+        _run_safe(batch_describe, args[1])
     else:
-        r = describe_one(args[0])
+        r = _run_safe(describe_one, args[0])
         print(r['description'])
         if r.get('emotions'):
             print(f"[情绪: {'、'.join(r['emotions'])}]")
