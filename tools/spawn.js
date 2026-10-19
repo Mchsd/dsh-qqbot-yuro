@@ -11,10 +11,11 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const ARG_SAFE = /^[A-Za-z0-9_\-./:?&=#%+@~ ]+$/
+const ARG_SAFE = /^[A-Za-z0-9_\-./:?&=#%+@~ \\]+$/
 
 export function scriptDir() {
-  return path.join(__dirname, 'scripts')
+  // python 脚本在包根的 scripts/，不在 tools/ 下（旧路径 tools/scripts 不存在，导致全部工具 exit=2）
+  return path.join(__dirname, '..', 'scripts')
 }
 
 export function validateArg(arg) {
@@ -32,6 +33,9 @@ export function buildScriptEnv(config, baseEnv = process.env) {
   if (config.llmBaseUrl) env.YURO_LLM_BASE_URL = config.llmBaseUrl
   if (config.model && config.model !== '<MODEL>') env.YURO_MODEL = config.model
   if (config.a2aBridgeDir) env.A2A_BRIDGE_DIR = config.a2aBridgeDir
+  // Windows 中文区域下 python 默认用 GBK 输出，emoji / 中文会 UnicodeEncodeError；统一按 UTF-8 输出。
+  env.PYTHONUTF8 = '1'
+  env.PYTHONIOENCODING = 'utf-8'
   return env
 }
 

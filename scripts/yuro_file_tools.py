@@ -20,15 +20,24 @@ import sys
 import yuro_layers  # [2026-08-22 分层] Yume/Yuro 白名单各自 work 目录（原硬编码生产 WORK, 蓝侧会误读生产）
 
 WORK = ''          # main() 按 --bot 设置
-SCRIPTS = r'C:\Users\<USER>\AppData\Local\<HERMES_SCRIPTS>'
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))  # 本脚本所在目录（插件 scripts/），不再硬编码 <USER> 占位符
 MAX_LINES = 50
 
 
 def safe_path(p: str):
-    norm = p.replace('\\', '/')
-    if norm.startswith(WORK.replace('\\', '/') + '/') or norm.startswith(SCRIPTS.replace('\\', '/') + '/'):
-        if '..' not in norm:
-            return p
+    """只放行 WORK 目录与 scripts 目录下的文件（绝对路径或相对 WORK 的路径）。"""
+    if '..' in p.replace('\\', '/').split('/'):
+        return None
+    cand = os.path.abspath(p if os.path.isabs(p) else os.path.join(WORK, p))
+    for root in (WORK, SCRIPTS):
+        if not root:
+            continue
+        root_abs = os.path.abspath(root)
+        try:
+            if os.path.commonpath([root_abs, cand]) == root_abs:
+                return cand
+        except ValueError:
+            continue
     return None
 
 

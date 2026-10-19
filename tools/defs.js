@@ -19,6 +19,7 @@ const SCRIPT = {
 }
 
 function jsonRender(_args, value) {
+  if (value.silent) return [{ type: 'text', text: value.stdout || '(无操作)' }]
   const lines = [value.stdout || '(无输出)']
   if (value.stderr) lines.push('[stderr] ' + value.stderr)
   if (!value.ok) lines.push(`[exit=${value.code}${value.timedOut ? ' timeout' : ''} ms=${value.ms}]`)
@@ -73,11 +74,13 @@ export function buildToolDefs(config) {
       output: { schema: { type: 'json' }, render: jsonRender },
       async execute(args) {
         const mode = args.mode || 'full'
-        if (mode === 'cache-only') return runPython(SCRIPT.image, botArgs(config, '--read-cache-only', args.image_path), config)
-        if (mode === 'cache-lite') return runPython(SCRIPT.image, botArgs(config, '--read-cache-lite', args.image_path), config)
+        // yuro_image_describe.py 不解析 --bot，且只按位置识别 --read-cache-* / --lite：
+        // cache 模式下必须把 flag 放在路径前，lite 模式下路径在前、--lite 在后。
         const a = [args.image_path]
+        if (mode === 'cache-only') return runPython(SCRIPT.image, ['--read-cache-only', args.image_path], config)
+        if (mode === 'cache-lite') return runPython(SCRIPT.image, ['--read-cache-lite', args.image_path], config)
         if (mode === 'lite') a.push('--lite')
-        return runPython(SCRIPT.image, botArgs(config, ...a), config)
+        return runPython(SCRIPT.image, a, config)
       },
     }),
 
@@ -122,7 +125,12 @@ export function buildToolDefs(config) {
       async execute(args) {
         const a = [args.action]
         if (args.group) a.push(args.group)
-        return runPython(SCRIPT.groupSleep, botArgs(config, ...a), config)
+        const r = runPython(SCRIPT.groupSleep, botArgs(config, ...a), config)
+        // yuro_group_sleep.py check 用 exit 1 表示「该群未在睡眠」：这是正常状态，不是错误。
+        if (args.action === 'check' && r.code === 1 && !r.stderr) {
+          return { ...r, ok: true, stdout: '该群当前清醒（未处于临时睡眠）', silent: false }
+        }
+        return r
       },
     }),
 
@@ -130,7 +138,7 @@ export function buildToolDefs(config) {
       name: 'yuro_group_energy',
       description: '查询某群当前精力百分比（睡眠/清醒的 U 型曲线调制）。回复节奏参考它。',
       parameters: {
-        group: { type: 'string', description: '群标识（缺省用最近活跃群）' },
+        group: { type: 'string', required: true, description: '群标识（群 openid / 群号）' },
       },
       output: { schema: { type: 'json' }, render: jsonRender },
       async execute(args) {
